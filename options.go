@@ -1,9 +1,12 @@
 package stats
 
 import (
+	"cmp"
+	"slices"
 	"time"
 
 	"github.com/convoy-road-trips-app/stats/models"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Option is a function that configures the stats client
@@ -13,6 +16,41 @@ type Option func(*Config)
 func WithServiceName(name string) Option {
 	return func(c *Config) {
 		c.ServiceName = name
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.ServiceName = name
+	}
+}
+
+// WithTemporality sets the temporality used for OTLP sums and histograms.
+func WithTemporality(temporality Temporality) Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.Temporality = temporality
+	}
+}
+
+// WithOTLPResourceAttributes merges resource attributes into the OTLP exporter configuration.
+func WithOTLPResourceAttributes(attrs ...attribute.KeyValue) Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.ResourceAttributes = append(c.OTLP.ResourceAttributes, attrs...)
+	}
+}
+
+// WithOTLPResourceSchemaURL sets the schema URL of the OTLP resource, the
+// ResourceMetrics.schema_url the collector receives.
+func WithOTLPResourceSchemaURL(schemaURL string) Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.ResourceSchemaURL = schemaURL
 	}
 }
 
@@ -20,6 +58,10 @@ func WithServiceName(name string) Option {
 func WithEnvironment(env string) Option {
 	return func(c *Config) {
 		c.Environment = env
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.DeploymentEnvironment = env
 	}
 }
 
@@ -58,7 +100,10 @@ func WithMaxMemoryBytes(bytes int64) Option {
 	}
 }
 
-// WithMaxCardinality sets the maximum unique attribute combinations
+// WithMaxCardinality sets the maximum distinct attribute sets (series) per
+// metric name per process. Unseen series beyond the limit are dropped and
+// counted in telemetry_dropped_labels_total; admitted series keep recording.
+// Zero means the default of 2000; negative values are rejected.
 func WithMaxCardinality(cardinality int) Option {
 	return func(c *Config) {
 		c.MaxCardinality = cardinality
@@ -123,14 +168,56 @@ func WithDatadog(cfg *DatadogConfig) Option {
 	}
 }
 
-// WithOTLP enables and configures OTLP exporter
+// WithOTLP enables and configures OTLP exporter. cfg is copied, so one option
+// can configure several clients.
 func WithOTLP(cfg *OTLPConfig) Option {
 	return func(c *Config) {
 		if cfg == nil {
 			return
 		}
-		cfg.Enabled = true
-		c.OTLP = cfg
+		merged := *cfg
+		merged.ResourceAttributes = slices.Clone(cfg.ResourceAttributes)
+		merged.HistogramBuckets = slices.Clone(cfg.HistogramBuckets)
+		if c.OTLP != nil {
+			if merged.HistogramBuckets == nil {
+				merged.HistogramBuckets = c.OTLP.HistogramBuckets
+			}
+			merged.Temporality = cmp.Or(merged.Temporality, c.OTLP.Temporality)
+			merged.ResourceAttributes = append(merged.ResourceAttributes, c.OTLP.ResourceAttributes...)
+			merged.ResourceSchemaURL = cmp.Or(merged.ResourceSchemaURL, c.OTLP.ResourceSchemaURL)
+			merged.ServiceName = cmp.Or(merged.ServiceName, c.OTLP.ServiceName)
+			merged.DeploymentEnvironment = cmp.Or(merged.DeploymentEnvironment, c.OTLP.DeploymentEnvironment)
+			merged.Retry = cmp.Or(merged.Retry, c.OTLP.Retry)
+		}
+		merged.Enabled = true
+		c.OTLP = &merged
+	}
+}
+
+// WithHistogramBuckets sets explicit OTLP histogram bounds. Values use the
+// metric's units; when unset, the OTLP exporter uses the D9 seconds buckets.
+func WithHistogramBuckets(bounds []float64) Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		if bounds == nil {
+			c.OTLP.HistogramBuckets = nil
+			return
+		}
+		c.OTLP.HistogramBuckets = append([]float64{}, bounds...)
+	}
+}
+
+// WithOTLPRetry retries retryable OTLP export failures with exponential backoff
+// from initial up to maxInterval, for at most maxElapsed per export. Retries
+// also stop when the export context ends.
+func WithOTLPRetry(initial, maxInterval, maxElapsed time.Duration) Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.Retry = &OTLPRetry{InitialInterval: initial, MaxInterval: maxInterval, MaxElapsedTime: maxElapsed}
 	}
 }
 

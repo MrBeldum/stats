@@ -21,8 +21,12 @@ type (
 	OTLPConfig = models.OTLPConfig
 	// RuntimeMetricsConfig is the runtime metrics configuration struct
 	RuntimeMetricsConfig = models.RuntimeMetricsConfig
+	// OTLPRetry bounds retries of failed OTLP exports
+	OTLPRetry = models.OTLPRetry
 	// OTLPProtocol selects gRPC or HTTP transport
 	OTLPProtocol = models.OTLPProtocol
+	// Temporality selects cumulative or delta metric export.
+	Temporality = models.Temporality
 	// DropStrategy is the drop strategy enum
 	DropStrategy = models.DropStrategy
 )
@@ -37,6 +41,10 @@ const (
 	OTLPProtocolGRPC = models.OTLPProtocolGRPC
 	// OTLPProtocolHTTP selects HTTP/protobuf transport (port 4318)
 	OTLPProtocolHTTP = models.OTLPProtocolHTTP
+	// Cumulative exports cumulative metric values.
+	Cumulative = models.Cumulative
+	// Delta exports metric values since the previous collection.
+	Delta = models.Delta
 )
 
 // DefaultConfig returns a configuration with sensible defaults
@@ -49,7 +57,7 @@ func DefaultConfig() *Config {
 		FlushInterval:    100 * time.Millisecond,
 		UDPTimeout:       100 * time.Millisecond,
 		MaxMemoryBytes:   10 * 1024 * 1024, // 10MB
-		MaxCardinality:   2000,
+		MaxCardinality:   defaultMaxCardinality,
 		DropStrategy:     DropNewest,
 		AdaptiveBatching: false,
 	}
@@ -77,6 +85,10 @@ func ValidateConfig(c *Config) error {
 		return fmt.Errorf("%w: max memory bytes must be positive", ErrInvalidConfig)
 	}
 
+	if c.MaxCardinality < 0 {
+		return fmt.Errorf("%w: max cardinality must not be negative", ErrInvalidConfig)
+	}
+
 	// Validate backend configs
 	if c.CloudWatch != nil && c.CloudWatch.Enabled {
 		if err := c.CloudWatch.Validate(); err != nil {
@@ -96,7 +108,7 @@ func ValidateConfig(c *Config) error {
 		}
 	}
 
-	if c.OTLP != nil && c.OTLP.Enabled {
+	if c.OTLP != nil && (c.OTLP.Enabled || c.OTLP.HistogramBuckets != nil || c.OTLP.Temporality != "" || len(c.OTLP.ResourceAttributes) > 0 || c.OTLP.Retry != nil) {
 		if err := c.OTLP.Validate(); err != nil {
 			return fmt.Errorf("otlp config: %w", err)
 		}

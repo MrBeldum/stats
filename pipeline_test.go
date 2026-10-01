@@ -82,7 +82,7 @@ func TestPipeline_ParallelExport(t *testing.T) {
 
 	// Measure time to process batch
 	start := time.Now()
-	p.processBatch(batch)
+	_ = p.processBatch(context.Background(), batch)
 	duration := time.Since(start)
 
 	// Verification
@@ -140,7 +140,7 @@ func TestPipeline_PanicRecovery(t *testing.T) {
 				t.Errorf("Pipeline panicked: %v", r)
 			}
 		}()
-		p.processBatch(batch)
+		_ = p.processBatch(context.Background(), batch)
 	}()
 
 	// Check error counts
@@ -182,7 +182,7 @@ func TestPipeline_ErrorTracking(t *testing.T) {
 	}
 
 	batch := []*Metric{{Name: "test", Value: 1}}
-	p.processBatch(batch)
+	_ = p.processBatch(context.Background(), batch)
 
 	// Check global errors
 	if p.errors.Load() != 1 {
@@ -196,5 +196,40 @@ func TestPipeline_ErrorTracking(t *testing.T) {
 	}
 	if stats.ExporterErrors["success"] != 0 {
 		t.Errorf("Expected 0 errors for 'success' exporter, got %d", stats.ExporterErrors["success"])
+	}
+}
+
+func TestWithHistogramBuckets_RejectsEmptyBuckets(t *testing.T) {
+	// Given
+	cfg := DefaultConfig()
+	WithHistogramBuckets([]float64{})(cfg)
+
+	// When
+	err := ValidateConfig(cfg)
+
+	// Then
+	if err == nil {
+		t.Fatal("expected empty OTLP histogram buckets to fail configuration validation")
+	}
+}
+
+func TestNewPipeline_defaultsOTLPServiceName_fromStatsConfig(t *testing.T) {
+	// Given
+	config := DefaultConfig()
+	config.ServiceName = "checkout-api"
+	config.OTLP = &OTLPConfig{Enabled: true, Endpoint: "localhost:4317", Insecure: true}
+
+	// When
+	pipeline, err := NewPipeline(config)
+	if err != nil {
+		t.Fatalf("create pipeline: %v", err)
+	}
+	if err := pipeline.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown pipeline: %v", err)
+	}
+
+	// Then
+	if config.OTLP.ServiceName != config.ServiceName {
+		t.Fatalf("OTLP service name = %q, want stats service name %q", config.OTLP.ServiceName, config.ServiceName)
 	}
 }

@@ -1,10 +1,10 @@
 # Stats - High-Performance OpenTelemetry-Compliant Stats Library
 
-A production-ready, non-blocking UDP-based stats library for Go with **full OpenTelemetry SDK compliance** and multi-backend support (Datadog, Prometheus, CloudWatch).
+A production-ready, non-blocking stats library for Go that implements the **OpenTelemetry Metrics API** and exports to multiple backends (Datadog, Prometheus, CloudWatch, OTLP).
 
 ## Features
 
-- ✅ **OpenTelemetry Compliant**: Full OTel SDK implementation with dual-mode operation
+- ✅ **OpenTelemetry Metrics API**: Sync and observable instruments, dual-mode operation, cumulative OTLP export with explicit-bucket histograms and exemplars ([details and limitations](docs/otel_compliance.md))
 - ✅ **Non-Blocking**: Never blocks your application, even under extreme load
 - ✅ **High Performance**: Lock-free ring buffer, >100k events/sec throughput
 - ✅ **Multi-Backend**: Datadog (DogStatsD), Prometheus (StatsD), CloudWatch (EMF)
@@ -22,6 +22,8 @@ A production-ready, non-blocking UDP-based stats library for Go with **full Open
 package main
 
 import (
+    "context"
+
     "github.com/convoy-road-trips-app/stats"
 )
 
@@ -41,16 +43,17 @@ func main() {
     defer client.Close()
 
     // Record metrics - never blocks!
-    client.Counter("http.requests", 1.0,
+    ctx := context.Background()
+    client.Counter(ctx, "http.requests", 1.0,
         stats.WithAttribute("method", "GET"),
         stats.WithAttribute("status", "200"),
     )
 
-    client.Gauge("memory.usage", 75.5,
+    client.Gauge(ctx, "memory.usage", 75.5,
         stats.WithAttribute("unit", "percent"),
     )
 
-    client.Histogram("response.time", 145.3,
+    client.Histogram(ctx, "response.time", 0.145,
         stats.WithAttribute("endpoint", "/api/users"),
     )
 }
@@ -118,8 +121,21 @@ func main() {
 ## Installation
 
 ```bash
-go get github.com/convoy-road-trips-app/stats
+go get github.com/convoy-road-trips-app/stats@v1.1.0
 ```
+
+Usage, flush/shutdown and an options reference: **[docs/usage.md](docs/usage.md)**. A runnable collector + Prometheus stack: [examples/docker](examples/docker/README.md).
+
+### Upgrading from v1.0.x (SemVer exception)
+
+v1.1.0 only adds Go API, but it changes behavior that v1.0.x code can observe, and is released as a minor version on purpose (v2 would need a `/v2` module path):
+
+- OTLP sums and histograms are **cumulative by default**; use `stats.WithTemporality(stats.Delta)` for the old delta export.
+- **Malformed attribute keys are rejected** (`ErrInvalidTagKey`).
+- **Cardinality limits** apply: 10 attributes per observation, 256-rune values, 2000 series per metric.
+- `Shutdown`/`Close` **drain** buffered metrics before returning.
+
+Pin `v1.0.1` if you need the previous behavior. Details: [CHANGELOG](CHANGELOG.md) and [docs/otel_compliance.md](docs/otel_compliance.md#limitations).
 
 ## Configuration
 
@@ -132,8 +148,8 @@ client, err := stats.NewClient(
     stats.WithEnvironment("production"),
 
     // Performance tuning
-    stats.WithBufferSize(16384),        // Ring buffer capacity (default: 8192)
-    stats.WithWorkers(4),                // Worker goroutines (default: 2)
+    stats.WithBufferSize(16384),        // Ring buffer capacity (default: 16384)
+    stats.WithWorkers(4),                // Worker goroutines (default: 4)
     stats.WithFlushInterval(100*time.Millisecond),
 
     // Memory limits
@@ -200,6 +216,26 @@ stats.WithOTLP(&stats.OTLPConfig{
 ```
 
 When `Enabled` is false (or the config is omitted), no connection is established and the exporter is a no-op. `Protocol` defaults to `"grpc"` if unset.
+
+OTLP export semantics (v1.1.0):
+
+- Counters and histograms are **cumulative** by default (`stats.WithTemporality(stats.Delta)` opts out; Prometheus' OTLP receiver drops delta series).
+- Histograms use explicit buckets: by default the D9 seconds bounds `0.005 … 10`, overridable with `stats.WithHistogramBuckets(...)`. In Prometheus they appear as `_bucket{le=...}`, `_count` and `_sum`.
+- `service.name`, `deployment.environment` and `service.version` come from options, `OTEL_SERVICE_NAME` / `DEPLOYMENT_ENVIRONMENT` / `SERVICE_VERSION`, or `OTEL_RESOURCE_ATTRIBUTES`.
+- The resource schema URL comes from `otel.WithResource` or `stats.WithOTLPResourceSchemaURL`. Metric description and unit are exported for observable instruments and for `stats.WithDescription` / `stats.WithUnit`.
+- Counter and histogram observations recorded under a sampled span carry `trace_id`/`span_id` exemplars.
+- `stats.WithOTLPRetry(...)` retries retryable failures. Background exports are bounded by `WithUDPTimeout` (100 ms default); raise it for remote collectors.
+
+#### Attribute and cardinality limits (all backends)
+
+- Attribute keys must be identifier segments joined by single dots, `^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$`, so OTel semantic-convention keys such as `http.method` are accepted unchanged. Other keys (`bad..key`, `http-method`) reject the observation with `stats.ErrInvalidTagKey`.
+- Values are capped at 256 runes, and only the first 10 keys in lexical order are kept.
+- At most 2000 attribute sets per metric name by default (`stats.WithMaxCardinality`); new series beyond that return `stats.ErrCardinalityLimit`.
+- Drops are counted in `telemetry_dropped_labels_total{reason}`.
+
+#### Flush and shutdown
+
+`client.Flush(ctx)` and `provider.ForceFlush(ctx)` export everything buffered with the caller's context; `Shutdown(ctx)` drains the buffer before returning. Use them at the end of each AWS Lambda invocation. A `stats.Recorder` has no `Flush`, so existing implementations keep compiling; `*Client` and `*NoOpClient` implement the separate `stats.Flusher` interface, so use `if f, ok := recorder.(stats.Flusher); ok { err = f.Flush(ctx) }`.
 
 #### Runtime Metrics (Go CPU + Heap)
 
@@ -304,22 +340,22 @@ See [docs/performance_guide.md](docs/performance_guide.md) for detailed performa
 
 ```go
 // Counter - monotonically increasing value
-client.Counter("requests.total", 1.0)
-client.Increment("page.views")
-client.IncrementBy("bytes.sent", 1024.0)
+client.Counter(ctx, "requests.total", 1.0)
+client.Increment(ctx, "page.views")
+client.IncrementBy(ctx, "bytes.sent", 1024.0)
 
 // Gauge - point-in-time value
-client.Gauge("cpu.usage", 45.2)
+client.Gauge(ctx, "cpu.usage", 45.2)
 
 // Histogram - statistical distribution
-client.Histogram("request.duration", 123.4)
-client.Timing("db.query", duration)
+client.Histogram(ctx, "request.duration", 0.1234) // seconds, matches the default buckets
+client.Timing(ctx, "db.query", duration)          // records milliseconds
 ```
 
 #### With Attributes
 
 ```go
-client.Counter("http.requests", 1.0,
+client.Counter(ctx, "http.requests", 1.0,
     stats.WithAttribute("method", "POST"),
     stats.WithAttribute("status", "201"),
     stats.WithAttribute("endpoint", "/api/users"),
@@ -345,12 +381,15 @@ fmt.Printf("Exporter Errors: %v\n", clientStats.Pipeline.ExporterErrors)
 |------------|-------------|------------------|
 | `Int64Counter` | Monotonically increasing integer | Request counts |
 | `Float64Counter` | Monotonically increasing float | Fractional increments |
-| `Int64UpDownCounter` | Can increase/decrease | Active connections |
-| `Float64UpDownCounter` | Can increase/decrease (float) | Temperature |
+| `Int64UpDownCounter` | Can increase/decrease (exported as a gauge of the latest increment) | Active connections |
+| `Float64UpDownCounter` | Can increase/decrease (exported as a gauge of the latest increment) | Temperature |
 | `Int64Histogram` | Distribution of integers | Response sizes |
 | `Float64Histogram` | Distribution of floats | Request durations |
 | `Int64Gauge` | Point-in-time integer | CPU cores |
 | `Float64Gauge` | Point-in-time float | CPU percentage |
+| `Int64/Float64ObservableCounter` | Callback-reported cumulative total | Bytes read since start |
+| `Int64/Float64ObservableUpDownCounter` | Callback-reported value, exported as a gauge | Queue depth |
+| `Int64/Float64ObservableGauge` | Callback-reported point-in-time value | Pool utilization |
 
 #### Creating Instruments
 
@@ -373,6 +412,10 @@ gauge, _ := meter.Float64Gauge("memory",
 )
 ```
 
+OTLP exports the description and unit of observable instruments; synchronous instruments accept them but do not export them yet.
+
+Values are carried as `float64`, so `Int64*` instruments are exported as OTLP double points and are exact only up to 2^53.
+
 See [docs/otel_compliance.md](docs/otel_compliance.md) for complete OTel documentation.
 
 ## Testing
@@ -391,6 +434,9 @@ make bench
 
 # Run linter
 make lint
+
+# OTLP -> collector -> Prometheus integration tests against grafana/otel-lgtm (requires Docker)
+make lgtm-test
 
 # Build
 make build
@@ -485,7 +531,7 @@ See [examples/testing/](examples/testing/) for a complete example.
 - [x] Makefile for common tasks
 
 ### ✅ Phase 4: OpenTelemetry Integration (Complete)
-- [x] Full OTel SDK compliance
+- [x] OpenTelemetry Metrics API implementation
 - [x] MeterProvider implementation
 - [x] All synchronous instruments
 - [x] Attribute conversion
@@ -494,10 +540,10 @@ See [examples/testing/](examples/testing/) for a complete example.
 - [x] Working examples
 
 ### 🔄 Phase 5: Advanced Features (Future)
-- [ ] Async/Observable instruments
+- [x] Async/Observable instruments (v1.1.0)
 - [ ] Metric views for cardinality control
 - [ ] Custom metric readers
-- [ ] Cumulative temporality support
+- [x] Cumulative temporality support (v1.1.0, OTLP default)
 - [x] Native OTLP exporter
 - [ ] String interning for attribute keys
 - [ ] Binary serialization optimization
@@ -510,7 +556,7 @@ See [examples/testing/](examples/testing/) for a complete example.
 3. **Zero Allocation**: Use object pools in hot paths
 4. **Isolated Failures**: Backend failures don't affect other backends
 5. **Observable**: Library exposes internal metrics
-6. **Standard Compliance**: Full OpenTelemetry SDK compatibility
+6. **Standard API**: Implements the OpenTelemetry Metrics API (see [limitations](docs/otel_compliance.md#limitations))
 7. **Backward Compatible**: Legacy API remains unchanged
 
 ## Documentation
