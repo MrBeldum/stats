@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-10-01
+
+### Fixed
+
+- **Cumulative OTLP exports omitted series not observed in the interval**: with cumulative temporality (the default) only series observed since the previous export were sent, so sparse series went stale in Prometheus-compatible backends. Every export now carries all known counters, histograms and gauges (gauges at their last value, unchanged `StartTimeUnixNano`), and an interval without observations re-exports the full state, as the OTel SDK does on each collection. Delta temporality still exports only observed series.
+
 ## [1.2.1] - 2026-10-01
 
 ### Fixed
@@ -132,6 +138,7 @@ A v2 release would need the module path `github.com/convoy-road-trips-app/stats/
 
 See [README.md](README.md) for installation and quick start guide.
 
+[1.2.2]: https://github.com/convoy-road-trips-app/stats/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/convoy-road-trips-app/stats/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/convoy-road-trips-app/stats/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/convoy-road-trips-app/stats/compare/v1.0.1...v1.1.0
