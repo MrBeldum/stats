@@ -21,6 +21,8 @@ type (
 	OTLPConfig = models.OTLPConfig
 	// RuntimeMetricsConfig is the runtime metrics configuration struct
 	RuntimeMetricsConfig = models.RuntimeMetricsConfig
+	// OTLPOverrides records the OTLP settings stated explicitly through options
+	OTLPOverrides = models.OTLPOverrides
 	// OTLPRetry bounds retries of failed OTLP exports
 	OTLPRetry = models.OTLPRetry
 	// OTLPProtocol selects gRPC or HTTP transport
@@ -108,7 +110,7 @@ func ValidateConfig(c *Config) error {
 		}
 	}
 
-	if c.OTLP != nil && (c.OTLP.Enabled || c.OTLP.HistogramBuckets != nil || c.OTLP.Temporality != "" || len(c.OTLP.ResourceAttributes) > 0 || c.OTLP.Retry != nil) {
+	if c.OTLP != nil && (c.OTLP.Enabled || c.OTLP.HistogramBuckets != nil || len(c.OTLP.BucketsByName) > 0 || c.OTLP.Temporality != "" || len(c.OTLP.ResourceAttributes) > 0 || c.OTLP.Retry != nil) {
 		if err := c.OTLP.Validate(); err != nil {
 			return fmt.Errorf("otlp config: %w", err)
 		}

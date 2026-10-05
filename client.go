@@ -35,12 +35,10 @@ type Client struct {
 
 // NewClient creates a new stats client with the given options
 func NewClient(opts ...Option) (*Client, error) {
-	// Start with default config
-	cfg := DefaultConfig()
-
-	// Apply options
-	for _, opt := range opts {
-		opt(cfg)
+	// Defaults, then options, then OTEL_* environment for what options left open
+	cfg, err := buildConfig(opts)
+	if err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
 	// Validate configuration
@@ -140,9 +138,10 @@ func (c *Client) recordValue(ctx context.Context, typ MetricType, name string, v
 }
 
 // record is the single, non-recursive recording path. It takes core.mu.RLock
-// once, fails with ErrClientClosed after shutdown, builds the attributes (the
-// metric's existing attributes first, then the explicit options) and hands m to
-// the pipeline. It never releases m; the caller owns it on error.
+// once, fails with ErrClientClosed after shutdown, builds the attributes (context
+// tags, then the metric's existing attributes, then the explicit options; the
+// last value wins on a duplicate key) and hands m to the pipeline, which
+// validates every key. It never releases m; the caller owns it on error.
 func (c *Client) record(ctx context.Context, m *Metric, opts []MetricOption) error {
 	core := c.core
 	core.mu.RLock()
@@ -152,6 +151,7 @@ func (c *Client) record(ctx context.Context, m *Metric, opts []MetricOption) err
 		return ErrClientClosed
 	}
 
+	prependContextTags(ctx, m)
 	for _, opt := range opts {
 		opt(m)
 	}
