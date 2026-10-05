@@ -168,6 +168,17 @@ func WithDatadog(cfg *DatadogConfig) Option {
 	}
 }
 
+// WithExporter registers a custom exporter. It runs after the built-in
+// exporters, in parallel with them, and gets its own entry in
+// PipelineStats.ExporterErrors under e.Name(). NewClient fails with
+// ErrInvalidConfig if e is nil or its name is already used by another exporter.
+// The client shuts the exporter down on Close.
+func WithExporter(e Exporter) Option {
+	return func(c *Config) {
+		c.Exporters = append(slices.Clone(c.Exporters), e)
+	}
+}
+
 // WithOTLP enables and configures OTLP exporter. cfg is copied, so one option
 // can configure several clients.
 func WithOTLP(cfg *OTLPConfig) Option {
@@ -206,6 +217,19 @@ func WithHistogramBuckets(bounds []float64) Option {
 			return
 		}
 		c.OTLP.HistogramBuckets = append([]float64{}, bounds...)
+	}
+}
+
+// WithHistogramBucketsFor sets explicit histogram bounds for one metric name,
+// overriding the global buckets for that metric. Bounds use the units you
+// record in and must be non-empty, finite and strictly increasing; NewClient
+// returns an error otherwise. The bounds are copied.
+func WithHistogramBucketsFor(name string, bounds ...float64) Option {
+	return func(c *Config) {
+		if c.HistogramBucketsByName == nil {
+			c.HistogramBucketsByName = make(map[string][]float64)
+		}
+		c.HistogramBucketsByName[name] = append([]float64{}, bounds...)
 	}
 }
 

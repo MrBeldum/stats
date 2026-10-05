@@ -114,11 +114,48 @@ func ValidateConfig(c *Config) error {
 		}
 	}
 
+	for name, bounds := range c.HistogramBucketsByName {
+		if err := models.ValidateHistogramBuckets(bounds); err != nil {
+			return fmt.Errorf("%w: histogram buckets for %q: %w", ErrInvalidConfig, name, err)
+		}
+	}
+
 	if c.RuntimeMetrics != nil && c.RuntimeMetrics.Enabled {
 		if err := c.RuntimeMetrics.Validate(); err != nil {
 			return fmt.Errorf("runtime metrics config: %w", err)
 		}
 	}
 
+	return validateCustomExporters(c)
+}
+
+// validateCustomExporters rejects nil custom exporters and names that are used
+// twice, including names of enabled built-in exporters: per-exporter error
+// counts are keyed by name.
+func validateCustomExporters(c *Config) error {
+	if len(c.Exporters) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(c.Exporters)+4)
+	for name, enabled := range map[string]bool{
+		"datadog":    c.Datadog != nil && c.Datadog.Enabled,
+		"prometheus": c.Prometheus != nil && c.Prometheus.Enabled,
+		"cloudwatch": c.CloudWatch != nil && c.CloudWatch.Enabled,
+		"otlp":       c.OTLP != nil && c.OTLP.Enabled,
+	} {
+		if enabled {
+			seen[name] = struct{}{}
+		}
+	}
+	for i, e := range c.Exporters {
+		if e == nil {
+			return fmt.Errorf("%w: custom exporter %d is nil", ErrInvalidConfig, i)
+		}
+		name := e.Name()
+		if _, dup := seen[name]; dup {
+			return fmt.Errorf("%w: duplicate exporter name %q", ErrInvalidConfig, name)
+		}
+		seen[name] = struct{}{}
+	}
 	return nil
 }
