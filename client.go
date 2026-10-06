@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +22,16 @@ type clientCore struct {
 	pipeline  *Pipeline
 	collector *runtimemetrics.Collector
 
+	// disabled is set once by NewClient when OTEL_SDK_DISABLED is true. A
+	// disabled core has no pipeline, no exporters and no collector, and every
+	// operation on it is a no-op; it is immutable, so it is read without mu.
+	disabled bool
+
+	// versionOnce guards the one-time stats_version/go_version report;
+	// reportVersions is false when version reporting is disabled.
+	versionOnce    sync.Once
+	reportVersions bool
+
 	// Shutdown coordination
 	shutdownOnce sync.Once
 	closed       bool
@@ -27,14 +39,27 @@ type clientCore struct {
 }
 
 // Client is the main stats library client. It is a thin handle over a shared
-// clientCore; NewClient returns the root handle.
+// clientCore; NewClient returns the root handle, and WithPrefix and WithTags
+// return immutable views that record through the same core.
 type Client struct {
-	core *clientCore
-	root bool
+	core   *clientCore
+	prefix string               // prepended, joined with ".", to every metric name
+	tags   []attribute.KeyValue // applied before context tags; never mutated
+	root   bool                 // true only for the client NewClient returned
 }
 
 // NewClient creates a new stats client with the given options
+//
+// When the OTEL_SDK_DISABLED environment variable is "true" (case-insensitive,
+// surrounding space ignored, as the OpenTelemetry specification defines it)
+// NewClient returns a disabled client without reading the options or the other
+// OTEL_* variables: no pipeline or exporter is created, nothing is dialed, and
+// every method does nothing and returns nil. See Disabled.
 func NewClient(opts ...Option) (*Client, error) {
+	if sdkDisabled() {
+		return &Client{core: &clientCore{cfg: DefaultConfig(), disabled: true}, root: true}, nil
+	}
+
 	// Defaults, then options, then OTEL_* environment for what options left open
 	cfg, err := buildConfig(opts)
 	if err != nil {
@@ -59,35 +84,58 @@ func NewClient(opts ...Option) (*Client, error) {
 
 	client := &Client{
 		core: &clientCore{
-			cfg:      cfg,
-			pipeline: pipeline,
+			cfg:            cfg,
+			pipeline:       pipeline,
+			reportVersions: versionReportingEnabled(cfg),
 		},
 		root: true,
 	}
 
 	if cfg.RuntimeMetrics != nil && cfg.RuntimeMetrics.Enabled {
-		record := func(name string, mtype MetricType, value float64) {
-			ctx := context.Background()
-			switch mtype {
-			case MetricTypeGauge:
-				_ = client.Gauge(ctx, name, value)
-			case MetricTypeCounter:
-				_ = client.Counter(ctx, name, value)
-			case MetricTypeHistogram:
-				_ = client.Histogram(ctx, name, value)
-			}
-		}
-		client.core.collector = runtimemetrics.New(
-			runtimemetrics.Config{
-				CollectInterval: cfg.RuntimeMetrics.CollectInterval,
-				Prefix:          cfg.RuntimeMetrics.Prefix,
-			},
-			record,
-		)
+		client.core.collector = runtimemetrics.New(client.runtimeConfig(cfg.RuntimeMetrics), client.runtimeRecord)
 		client.core.collector.Start()
 	}
 
 	return client, nil
+}
+
+// Disabled reports whether the client was created while OTEL_SDK_DISABLED was
+// true. A disabled client, and every view of it, records nothing and returns
+// nil from every method.
+func (c *Client) Disabled() bool {
+	return c.core.disabled
+}
+
+// runtimeConfig builds the collector configuration. Collector failures are
+// counted under ExporterErrors["runtimemetrics.<source>"].
+func (c *Client) runtimeConfig(rc *RuntimeMetricsConfig) runtimemetrics.Config {
+	return runtimemetrics.Config{
+		CollectInterval: rc.CollectInterval,
+		Prefix:          rc.Prefix,
+		ProcessMetrics:  rc.ProcessMetrics,
+		DelayMetrics:    rc.DelayMetrics,
+		OnError: func(source string, _ error) {
+			c.core.pipeline.RecordExporterError("runtimemetrics." + source)
+		},
+	}
+}
+
+// runtimeRecord is the runtimemetrics.RecordFunc that routes collector output
+// into the pipeline.
+func (c *Client) runtimeRecord(name string, mtype MetricType, value float64, attrs ...attribute.KeyValue) {
+	ctx := context.Background()
+	var opts []MetricOption
+	if len(attrs) > 0 {
+		opts = []MetricOption{withKeyValues(attrs)}
+	}
+	switch mtype {
+	case MetricTypeGauge:
+		_ = c.Gauge(ctx, name, value, opts...)
+	case MetricTypeCounter:
+		_ = c.Counter(ctx, name, value, opts...)
+	case MetricTypeHistogram:
+		_ = c.Histogram(ctx, name, value, opts...)
+	}
 }
 
 // Counter records a counter metric
@@ -113,9 +161,57 @@ func (c *Client) RecordMetric(ctx context.Context, m *Metric) error {
 	return c.record(ctx, m, nil)
 }
 
+// WithPrefix returns a view of c that prepends prefix to every metric name,
+// joined to the parent's prefix and the metric name with ".". Empty parts are
+// skipped, so WithPrefix("api").WithPrefix("v1") records "req" as "api.v1.req".
+// opts add tags to the view, exactly as WithTags does; only their attributes
+// are used.
+//
+// The view shares the parent's pipeline and lifecycle: Close and Shutdown on a
+// view do nothing and return nil, Flush and Stats act on the root, and
+// recording fails with ErrClientClosed once the root is closed. The view is
+// immutable and safe for concurrent use.
+func (c *Client) WithPrefix(prefix string, opts ...MetricOption) *Client {
+	v := c.view(opts)
+	v.prefix = joinName(c.prefix, prefix)
+	return v
+}
+
+// WithTags returns a view of c that keeps its prefix and adds tags from opts
+// (for example WithAttribute); other option effects are ignored. View tags are
+// applied before context tags, the metric's own attributes and explicit
+// options, and a later tag wins over an earlier one with the same key, so a
+// child's tag overrides its parent's. Lifecycle is as for WithPrefix.
+func (c *Client) WithTags(opts ...MetricOption) *Client {
+	return c.view(opts)
+}
+
+// view returns a non-root copy of c whose tags are c's tags followed by the
+// attributes opts add.
+func (c *Client) view(opts []MetricOption) *Client {
+	var scratch Metric
+	for _, opt := range opts {
+		opt(&scratch)
+	}
+	return &Client{
+		core:   c.core,
+		prefix: c.prefix,
+		tags:   slices.Concat(c.tags, scratch.Attributes),
+	}
+}
+
+// joinName joins the non-empty parts with ".".
+func joinName(parts ...string) string {
+	parts = slices.DeleteFunc(slices.Clone(parts), func(s string) bool { return s == "" })
+	return strings.Join(parts, ".")
+}
+
 // recordValue validates the input, builds a pooled metric and records it. The
 // metric returns to the pool when recording fails.
 func (c *Client) recordValue(ctx context.Context, typ MetricType, name string, value float64, opts []MetricOption) error {
+	if c.core.disabled {
+		return nil
+	}
 	if err := validateMetricInput(name, value); err != nil {
 		// A closed client reports ErrClientClosed in preference to bad input.
 		if c.core.isClosed() {
@@ -138,12 +234,16 @@ func (c *Client) recordValue(ctx context.Context, typ MetricType, name string, v
 }
 
 // record is the single, non-recursive recording path. It takes core.mu.RLock
-// once, fails with ErrClientClosed after shutdown, builds the attributes (context
-// tags, then the metric's existing attributes, then the explicit options; the
-// last value wins on a duplicate key) and hands m to the pipeline, which
-// validates every key. It never releases m; the caller owns it on error.
+// once, fails with ErrClientClosed after shutdown, prefixes and validates the
+// name, builds the attributes (view tags, then context tags, then the metric's
+// existing attributes, then the explicit options; the last value wins on a
+// duplicate key) and hands m to the pipeline, which validates every key. It
+// never releases m; the caller owns it on error, and m's name is then restored.
 func (c *Client) record(ctx context.Context, m *Metric, opts []MetricOption) error {
 	core := c.core
+	if core.disabled {
+		return nil
+	}
 	core.mu.RLock()
 	defer core.mu.RUnlock()
 
@@ -151,12 +251,27 @@ func (c *Client) record(ctx context.Context, m *Metric, opts []MetricOption) err
 		return ErrClientClosed
 	}
 
+	name := m.Name
+	m.Name = joinName(c.prefix, name)
+	if err := validateMetricName(m.Name); err != nil {
+		m.Name = name
+		return err
+	}
+
 	prependContextTags(ctx, m)
+	m.Attributes = slices.Insert(m.Attributes, 0, c.tags...)
 	for _, opt := range opts {
 		opt(m)
 	}
 
-	return core.pipeline.Record(ctx, m)
+	if err := core.pipeline.Record(ctx, m); err != nil {
+		m.Name = name
+		return err
+	}
+	if c.root {
+		core.reportVersionsOnce()
+	}
+	return nil
 }
 
 // isClosed reports whether the core has begun shutting down.
@@ -178,16 +293,23 @@ func (c *Client) IncrementBy(ctx context.Context, name string, value float64, op
 	return c.Counter(ctx, name, value, opts...)
 }
 
-// Timing records a timing metric (histogram) in milliseconds
+// Timing records a timing metric (histogram) in milliseconds, truncated to a
+// whole millisecond. New code should use Observe, which records seconds without
+// truncation and is the unit OpenTelemetry and Prometheus expect. Timing is kept
+// unchanged for existing callers.
 // Context is propagated for cancellation, deadlines, and tracing
 func (c *Client) Timing(ctx context.Context, name string, duration time.Duration, opts ...MetricOption) error {
 	ms := float64(duration.Milliseconds())
 	return c.Histogram(ctx, name, ms, opts...)
 }
 
-// Stats returns client statistics
+// Stats returns client statistics. A disabled client, or a view of one, returns
+// a zero ClientStats whose Pipeline.ExporterErrors is an empty, non-nil map.
 func (c *Client) Stats() ClientStats {
 	core := c.core
+	if core.disabled {
+		return ClientStats{Pipeline: PipelineStats{ExporterErrors: map[string]uint64{}}}
+	}
 	core.mu.RLock()
 	defer core.mu.RUnlock()
 
@@ -285,14 +407,8 @@ func (mb *MetricBuilder) Build() *Metric {
 
 // validateMetricInput validates metric name and value
 func validateMetricInput(name string, value float64) error {
-	// Validate metric name
-	if name == "" {
-		return fmt.Errorf("%w: metric name cannot be empty", ErrInvalidConfig)
-	}
-
-	// Prevent excessively long names (DoS protection)
-	if len(name) > 256 {
-		return fmt.Errorf("%w: metric name exceeds maximum length (256 characters)", ErrInvalidConfig)
+	if err := validateMetricName(name); err != nil {
+		return err
 	}
 
 	// Validate value is not NaN or Inf
@@ -304,5 +420,17 @@ func validateMetricInput(name string, value float64) error {
 		return fmt.Errorf("%w: metric value cannot be Inf", ErrInvalidConfig)
 	}
 
+	return nil
+}
+
+// validateMetricName rejects an empty name and one longer than 256 characters
+// (DoS protection). record applies it to the full, prefixed name.
+func validateMetricName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: metric name cannot be empty", ErrInvalidConfig)
+	}
+	if len(name) > 256 {
+		return fmt.Errorf("%w: metric name exceeds maximum length (256 characters)", ErrInvalidConfig)
+	}
 	return nil
 }

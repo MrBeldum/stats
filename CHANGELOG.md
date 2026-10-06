@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`OTEL_SDK_DISABLED`**: when it is `true` (case-insensitive), `NewClient` and `otel.NewMeterProvider` start no pipeline, exporter or runtime collector and dial nothing. Every recording method (and views from `WithPrefix`/`WithTags`) does nothing and returns nil without validating input; `Flush`, `Shutdown` and `Close` return nil; `Stats()` returns a zero `ClientStats` with an empty `ExporterErrors` map; observable callbacks are never registered. `Client.Disabled()` reports the state.
+- **Version reporting**: the first successful record on a root client also records the gauges `stats_version` (the module version of this library, or `(devel)`) and `go_version` (`runtime.Version()`, skipped for `devel` toolchains), each with value 1 and tagged with `service` and `environment` only. This adds two series per process, and tests that count exported metrics see two extra observations. Disable both with `WithVersionReporting(false)` or `STATS_DISABLE_GO_VERSION_REPORTING=true|TRUE|yes|1`; the option wins over the environment. `statstest.NewClient` disables reporting by default.
 - **Default `service.instance.id` resource attribute**: OTLP exports now set `service.instance.id` to the hostname when neither `OTEL_RESOURCE_ATTRIBUTES` nor `WithOTLPResourceAttributes` provides one (a random hex ID if there is no hostname). Previously replicas of one service exported identical series, so cumulative counters from different processes interleaved as false resets and gauges flapped between replicas. Prometheus-compatible backends receive it as the `instance` label, so expect one series per replica; aggregate with `sum`/`max` across `instance`. To opt out, set `service.instance.id` explicitly (for example `OTEL_RESOURCE_ATTRIBUTES=service.instance.id=<name>`).
+
+### Fixed
+
+- **OTLP transport settings are always the ones this library resolved**: the SDK exporters read `OTEL_EXPORTER_OTLP_*` themselves before our options ran, so a stray `OTEL_EXPORTER_OTLP_CERTIFICATE` could break an insecure endpoint and environment headers or compression could leak into an explicitly configured exporter. The endpoint (including its path), TLS mode, headers, timeout and compression are now passed explicitly. `OTEL_EXPORTER_OTLP_CERTIFICATE`, the `*_CLIENT_*` variables and the histogram aggregation variable are unsupported and have no effect. An `http://` endpoint URL implies an insecure connection.
 
 ## [1.2.2] - 2026-10-01
 
