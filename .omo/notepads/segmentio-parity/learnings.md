@@ -46,3 +46,36 @@ Conventions, patterns, and successful approaches discovered during work on this 
 - Pure-LOC check: strip blank and `//` lines (`grep -v '^\s*$' | grep -v '^\s*//' | wc -l`); the ceiling is 250. Splits are same-package, by responsibility; shared test helpers live in `*_helpers_test.go`. Test count (`go test -list . ./...`) was identical before and after (621).
 - Example lint: `main` calls `run() error` (so `defer` runs before `os.Exit`); `net.Listen`/`DialTimeout` become `net.ListenConfig.Listen(ctx, ...)`/`net.Dialer.DialContext`, which needs the ctx created before the listener; `defer x.Close()` becomes `defer func() { _ = x.Close() }()`; gocyclo on `run()` fixed by extracting `record` and `scrape` helpers.
 - A golangci-lint cache shared across worktrees prints "failed to get doc" warnings for files of deleted worktrees; harmless, but use a per-worktree `GOLANGCI_LINT_CACHE`.
+
+## gap-netstats
+- Upstream zone discovery (conn.go zoneOf/currentZone) uses github.com/segmentio/vpcinfo (AWS metadata subnets -> AZ names), not address inspection. Only an offline address-class equivalent is possible without a dependency; in_zone then means same network class, not same AZ.
+- Upstream `BaseConn()` is just a method on the unexported conn. An exported interface named BaseConn cannot be embedded in a struct and still expose the method (field name shadows it), so users implement it rather than embed it.
+
+## httpstats gap closure
+- Tag keys must match `^[a-zA-Z_][a-zA-Z0-9_]*(\.…)*$`, so a `-` in a key (e.g. `http.request.header.content-type`) makes `validTagKey` reject the whole metric silently; use `content_type`.
+- `NewHandler*`/`NewTransport*` gained variadic `...Option` (`WithContentAttributes`); source compatible, but not for code that stores them in a func-typed variable.
+- Request/response counts deliberately not added: duration histogram count already is the request count.
+
+## Runtime metrics gap closure (procstats)
+- `MemStats.Lookups` is declared but never written by the Go runtime (only the heap dumper reads it) and has no `runtime/metrics` source, so it is documented as not provided instead of emitted as a constant zero.
+- Go defines `MemStats.Alloc` as `HeapAlloc`; `memory.alloc` and `memory.heap.alloc` are the same value from the same sample. `HeapSys` = heap/objects + heap/unused + heap/free + heap/released.
+- Pre-existing, not changed: `memory.heap.inuse` and `memory.heap.idle` map to `/memory/classes/heap/inuse:bytes` and `/idle:bytes`, which do not exist in `runtime/metrics` (Go 1.27 lists only heap/free, objects, released, stacks, unused), so those two names are never emitted. `TestExistingNamesUnchanged` hides it because it only asserts names whose source exists. Fix would be a derived mapping (inuse = objects+unused, idle = free+released) in a separate change.
+- New CPU percent series use new names (`cpu.usage_user.percent`...) rather than a `type` attribute on `cpu.usage.percent`: a same-name typed series would double count when a backend sums the untyped one. They divide by the cgroup quota in cores when set, else GOMAXPROCS; `cpu.usage.percent` keeps GOMAXPROCS.
+- `runtimemetrics.Collector` is already the built-in struct, so the upstream `Collector` interface is `MetricCollector` here.
+- testify `Eventually` runs its condition on its own goroutine, so a goroutine-leak assertion inside it counts the helper; poll by hand.
+- BSD `sed -i` needs `-i ''`; a failing `sed` in a `&&` chain silently skipped the test step and a commit still ran after `;`. Chain with `&&` all the way.
+- Verified on Linux by cross-compiling test binaries (`GOOS=linux GOARCH=arm64 go test -c`) and running them in `debian:stable-slim` under docker with `--cpus 1.5`: real `/proc`, cgroup v2 `cpu.max` (150000 100000) and `CollectProcInfo` of a child process all work.
+
+## gap-otlp-transport (TLS, escape hatches, resource detection, env gaps)
+- The worktree has no vendor/ directory on origin/feat/sp-38-docs (go builds from the module cache); no go.mod change was needed: grpc, otlpmetrichttp and sdk/resource were already required.
+- SDK facts used: otlpmetrichttp `WithHTTPClient` beats `WithTLSClientConfig`/`WithTimeout` and leaves the client's Timeout alone; otlpmetricgrpc `WithDialOption` options are appended after the SDK's own (credentials, compressor), so they can override them. `WithTLSClientConfig(nil)`/`WithTLSCredentials(nil)` still clear env TLS (D4).
+- TLS files are read in `exporters/otlp/tls.go`, only when the endpoint is secure; env resolution in the root package only fills `CAFile`/`ClientCertFile`/`ClientKeyFile` (new `OTLPOverrides` pointers, set by `WithOTLP` like the other transport fields).
+- Resource detection uses `resource.New` with host, PID, runtime name/version/description and telemetry SDK detectors, cached in a `sync.OnceValue`; command args, owner and executable path are left out (secrets). Tests that asserted exact resource attribute sets now count `detectedAttributes()` or filter the detected keys.
+- `lowmemory` == `delta` for this library: all sums are monotonic counters and up-down counters are exported as gauges, so no new `Temporality` value was added.
+- `OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION` has no generic form in the spec, so it is read through `envValue`, not `signalEnv`; it does not override stated `WithExponentialHistogram` or `WithHistogramBuckets`.
+
+## gap-core-api
+- Unprefixed bucket registrations are stored in the same `byName` map under `models.UnprefixedBucketsPrefix` ("*.") + name, as segmentio does, so the OTLP merge, validation and Prometheus copy needed no change. `models.BucketsFor` order: exact, longest "." suffix, global, default.
+- `MakeMetrics` reuses `Report` through a private `valueRecorder` (Counter/Gauge/Histogram subset of `Recorder`), so the two cannot drift. `Recorder` itself is unchanged.
+- `AllowDuplicateTags` cannot be added: `cardinality.go` canonicalizes with `attribute.NewSet` for every metric and OTLP/Prometheus aggregate by `attribute.Set`.
+- On macOS use perl -pi, not `sed -i` without a suffix argument.

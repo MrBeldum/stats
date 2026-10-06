@@ -1,11 +1,15 @@
 package models
 
 import (
+	"crypto/tls"
 	"fmt"
 	"math"
+	"net/http"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/grpc"
 )
 
 // OTLPProtocol selects the transport for the OTLP exporter.
@@ -54,6 +58,39 @@ type OTLPConfig struct {
 	// those explicit buckets. HistogramBuckets then applies to no metric. Nil
 	// exports every histogram with explicit buckets.
 	ExponentialHistogram *OTLPExponentialHistogram
+	// TLSConfig is the base TLS configuration of a secure connection, HTTP and
+	// gRPC alike; it is cloned. CAFile, ClientCertFile and ClientKeyFile are
+	// applied on top of it: CAFile replaces RootCAs and the client key pair is
+	// appended to Certificates. A zero MinVersion becomes TLS 1.2. Nothing here
+	// relaxes verification unless the caller sets InsecureSkipVerify in this
+	// struct. Ignored when Insecure is true (or the endpoint URL scheme is http).
+	TLSConfig *tls.Config
+	// CAFile is a PEM file of the certificates that sign the server certificate.
+	// It replaces the system roots. Ignored when the connection is insecure.
+	CAFile string
+	// ClientCertFile and ClientKeyFile are PEM files holding the client key
+	// pair for mutual TLS; either both or neither must be set.
+	ClientCertFile string
+	ClientKeyFile  string
+	// DisableResourceDetection turns off the automatic host, process and SDK
+	// resource attributes (host.name, process.pid, process.runtime.*,
+	// telemetry.sdk.*). They are detected by default and lose to
+	// OTEL_RESOURCE_ATTRIBUTES and to ResourceAttributes.
+	DisableResourceDetection bool
+	// HTTPClient, for the HTTP protocol only, is the client the exporter sends
+	// requests with. The exporter then neither builds its own transport nor
+	// applies TLSConfig, CAFile, ClientCertFile or ClientKeyFile (the client
+	// owns TLS, proxying and connection limits), and does not set the client's
+	// Timeout; ExportTimeout still bounds each export through its context.
+	// Endpoint, path, headers, compression and retry still apply. The client
+	// is shared, not copied, and not closed by the exporter. An insecure
+	// endpoint is plain HTTP regardless of the client.
+	HTTPClient *http.Client
+	// GRPCDialOptions, for the gRPC protocol only, are appended after the
+	// options the exporter sets itself (user agent, credentials, compressor,
+	// connection parameters), so they can override them, for example with
+	// grpc.WithTransportCredentials or grpc.WithContextDialer.
+	GRPCDialOptions []grpc.DialOption
 }
 
 // Defaults of OTLPExponentialHistogram, the OTel SDK defaults for base-2
@@ -123,6 +160,10 @@ type OTLPOverrides struct {
 	Compression *string
 	Protocol    *OTLPProtocol
 	Temporality *Temporality
+
+	CAFile         *string
+	ClientCertFile *string
+	ClientKeyFile  *string
 }
 
 // OTLPRetry is an exponential-backoff policy for retryable OTLP export
@@ -165,17 +206,66 @@ func ValidateHistogramBuckets(bounds []float64) error {
 	return nil
 }
 
-// BucketsFor returns the histogram bounds for a metric name: the per-name
-// entry, then the global bounds, then DefaultHistogramBuckets(). Bounds use
-// the units the metric is recorded in.
+// UnprefixedBucketsPrefix marks a BucketsFor registration made for a metric
+// name without the prefix a client adds to it. Use UnprefixedBucketsKey to
+// build the key; WithUnprefixedHistogramBucketsFor does so for you.
+const UnprefixedBucketsPrefix = "*."
+
+// UnprefixedBucketsKey returns the byName key that registers bounds for name
+// and for every name that ends in ".name", whatever prefix a client puts in
+// front of it.
+func UnprefixedBucketsKey(name string) string {
+	return UnprefixedBucketsPrefix + name
+}
+
+// BucketsFor returns the histogram bounds for a metric name. Precedence:
+//
+//  1. the exact per-name entry;
+//  2. an unprefixed entry (see UnprefixedBucketsKey), trying the full name and
+//     then each suffix that starts after a "." separator, longest first, so
+//     an entry for "request.duration" also serves "myapp.request.duration";
+//  3. the global bounds;
+//  4. DefaultHistogramBuckets().
+//
+// A plain entry never matches by suffix: only entries registered as unprefixed
+// do. Bounds use the units the metric is recorded in.
 func BucketsFor(byName map[string][]float64, global []float64, name string) []float64 {
-	if bounds := byName[name]; len(bounds) > 0 {
+	if bounds, ok := NamedBuckets(byName, name); ok {
 		return bounds
 	}
 	if len(global) > 0 {
 		return global
 	}
 	return DefaultHistogramBuckets()
+}
+
+// NamedBuckets returns the bounds registered for name in byName: the exact
+// entry, else the longest matching unprefixed entry (see BucketsFor). ok is
+// false when name has no registration, in which case callers fall back to
+// global bounds or another aggregation.
+func NamedBuckets(byName map[string][]float64, name string) (bounds []float64, ok bool) {
+	if bounds := byName[name]; len(bounds) > 0 {
+		return bounds, true
+	}
+	if bounds := unprefixedBuckets(byName, name); len(bounds) > 0 {
+		return bounds, true
+	}
+	return nil, false
+}
+
+// unprefixedBuckets resolves name against the unprefixed entries of byName,
+// longest matching suffix first.
+func unprefixedBuckets(byName map[string][]float64, name string) []float64 {
+	for {
+		if bounds := byName[UnprefixedBucketsKey(name)]; len(bounds) > 0 {
+			return bounds
+		}
+		i := strings.IndexByte(name, '.')
+		if i < 0 {
+			return nil
+		}
+		name = name[i+1:]
+	}
 }
 
 // Validate validates the OTLP configuration
@@ -201,6 +291,16 @@ func (c *OTLPConfig) Validate() error {
 	}
 	if !c.Enabled {
 		return nil
+	}
+	if (c.ClientCertFile == "") != (c.ClientKeyFile == "") {
+		return fmt.Errorf("client certificate and client key must be set together")
+	}
+
+	if c.HTTPClient != nil && c.Protocol != OTLPProtocolHTTP {
+		return fmt.Errorf("HTTPClient requires the %q protocol", OTLPProtocolHTTP)
+	}
+	if len(c.GRPCDialOptions) > 0 && c.Protocol == OTLPProtocolHTTP {
+		return fmt.Errorf("GRPCDialOptions requires the %q protocol", OTLPProtocolGRPC)
 	}
 
 	if c.Endpoint == "" {
