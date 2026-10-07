@@ -3,6 +3,7 @@ package datadog
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -10,40 +11,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/convoy-road-trips-app/stats/models"
-	"go.opentelemetry.io/otel/attribute"
 )
-
-func counter(name string, v float64) *models.Metric {
-	return &models.Metric{Name: name, Type: models.MetricTypeCounter, Value: v}
-}
-
-// readPackets reads datagrams from conn until it is quiet for 300ms.
-func readPackets(t *testing.T, conn net.PacketConn) []string {
-	t.Helper()
-	var out []string
-	buf := make([]byte, 70000)
-	for {
-		_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-		n, _, err := conn.ReadFrom(buf)
-		if err != nil {
-			return out
-		}
-		out = append(out, string(buf[:n]))
-	}
-}
-
-func listenUDP(t *testing.T) *net.UDPConn {
-	t.Helper()
-	ln, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	return ln
-}
 
 func TestUnixgramDelivers(t *testing.T) {
 	if runtime.GOOS == "windows" {
@@ -197,127 +167,38 @@ func TestNewExporterCopiesConfig(t *testing.T) {
 	}
 }
 
-func exportHistogram(t *testing.T, cfg *models.DatadogConfig, name string) {
-	t.Helper()
-	e, err := NewExporter(cfg)
+func TestSendEventDelivers(t *testing.T) {
+	ln := listenUDP(t)
+	exp, err := NewExporter(&models.DatadogConfig{Enabled: true, AgentHost: "127.0.0.1", AgentPort: ln.LocalAddr().(*net.UDPAddr).Port})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e.Shutdown(context.Background())
-	m := &models.Metric{Name: name, Type: models.MetricTypeHistogram, Value: 2}
-	if err := e.Export(context.Background(), []*models.Metric{m}); err != nil {
+	defer exp.Shutdown(context.Background())
+
+	if err := exp.SendEvent(context.Background(), models.DatadogEvent{Title: "t", Text: "a\nb"}); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestExporterUseDistributions(t *testing.T) {
-	ln := listenUDP(t)
-	cfg := &models.DatadogConfig{Enabled: true, Endpoint: ln.LocalAddr().String(), UseDistributions: true}
-	exportHistogram(t, cfg, "latency")
-	if got := readPackets(t, ln); len(got) != 1 || got[0] != "latency:2|d" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestExporterDistributionPrefixes(t *testing.T) {
-	ln := listenUDP(t)
-	cfg := &models.DatadogConfig{Enabled: true, Endpoint: ln.LocalAddr().String(), DistributionPrefixes: []string{"http."}}
-	exportHistogram(t, cfg, "http.latency")
-	exportHistogram(t, cfg, "db.latency")
 	got := readPackets(t, ln)
-	if len(got) != 2 || got[0] != "http.latency:2|d" || got[1] != "db.latency:2|h" {
+	if len(got) != 1 || got[0] != `_e{1,4}:t|a\nb` {
 		t.Fatalf("got %q", got)
 	}
 }
 
-func TestNewExporterCopiesDistributionPrefixes(t *testing.T) {
+func TestSendEventTooLarge(t *testing.T) {
 	ln := listenUDP(t)
-	cfg := &models.DatadogConfig{Enabled: true, Endpoint: ln.LocalAddr().String(), DistributionPrefixes: []string{"http."}}
-	e, err := NewExporter(cfg)
+	exp, err := NewExporter(&models.DatadogConfig{
+		Enabled: true, AgentHost: "127.0.0.1", AgentPort: ln.LocalAddr().(*net.UDPAddr).Port, BufferSize: 32,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer e.Shutdown(context.Background())
-	cfg.DistributionPrefixes[0] = "db."
+	defer exp.Shutdown(context.Background())
 
-	ms := []*models.Metric{
-		{Name: "http.latency", Type: models.MetricTypeHistogram, Value: 2},
-		{Name: "db.latency", Type: models.MetricTypeHistogram, Value: 2},
+	err = exp.SendEvent(context.Background(), models.DatadogEvent{Title: "t", Text: strings.Repeat("x", 64)})
+	if !errors.Is(err, models.ErrEventTooLarge) {
+		t.Fatalf("err = %v, want ErrEventTooLarge", err)
 	}
-	if err := e.Export(context.Background(), ms); err != nil {
-		t.Fatal(err)
-	}
-	if got := readPackets(t, ln); len(got) != 1 || got[0] != "http.latency:2|d\ndb.latency:2|h" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func pathMetric() *models.Metric {
-	return &models.Metric{
-		Name: "req", Type: models.MetricTypeCounter, Value: 1,
-		Attributes: []attribute.KeyValue{
-			attribute.String("http_req_path", "/a/1"),
-			attribute.String("method", "GET"),
-		},
-	}
-}
-
-func exportOne(t *testing.T, cfg *models.DatadogConfig, m *models.Metric) {
-	t.Helper()
-	e, err := NewExporter(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer e.Shutdown(context.Background())
-	if err := e.Export(context.Background(), []*models.Metric{m}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestDefaultFilterDropsHTTPReqPath(t *testing.T) {
-	ln := listenUDP(t)
-	m := pathMetric()
-	exportOne(t, &models.DatadogConfig{Enabled: true, Endpoint: ln.LocalAddr().String()}, m)
-	if got := readPackets(t, ln); len(got) != 1 || got[0] != "req:1|c|#method:GET" {
-		t.Fatalf("got %q", got)
-	}
-	if len(m.Attributes) != 2 || string(m.Attributes[0].Key) != "http_req_path" {
-		t.Fatalf("shared metric mutated: %v", m.Attributes)
-	}
-}
-
-func TestEmptyFiltersKeepAll(t *testing.T) {
-	ln := listenUDP(t)
-	cfg := &models.DatadogConfig{Enabled: true, Endpoint: ln.LocalAddr().String(), Filters: []string{}}
-	exportOne(t, cfg, pathMetric())
-	if got := readPackets(t, ln); len(got) != 1 || got[0] != "req:1|c|#http_req_path:/a/1,method:GET" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestCustomFiltersStripOnlyListed(t *testing.T) {
-	ln := listenUDP(t)
-	cfg := &models.DatadogConfig{Enabled: true, Endpoint: ln.LocalAddr().String(), Filters: []string{"method"}}
-	exportOne(t, cfg, pathMetric())
-	if got := readPackets(t, ln); len(got) != 1 || got[0] != "req:1|c|#http_req_path:/a/1" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestNewExporterCopiesFilters(t *testing.T) {
-	ln := listenUDP(t)
-	cfg := &models.DatadogConfig{Enabled: true, Endpoint: ln.LocalAddr().String(), Filters: []string{"method"}}
-	e, err := NewExporter(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer e.Shutdown(context.Background())
-	cfg.Filters[0] = "http_req_path"
-
-	if err := e.Export(context.Background(), []*models.Metric{pathMetric()}); err != nil {
-		t.Fatal(err)
-	}
-	if got := readPackets(t, ln); len(got) != 1 || got[0] != "req:1|c|#http_req_path:/a/1" {
-		t.Fatalf("got %q", got)
+	if got := readPackets(t, ln); len(got) != 0 {
+		t.Fatalf("oversized event was sent: %q", got)
 	}
 }

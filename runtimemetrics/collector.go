@@ -25,7 +25,9 @@ type Config struct {
 
 	// ProcessMetrics enables process-level metrics (CPU, memory, files, threads).
 	ProcessMetrics bool
-	// DelayMetrics enables kernel scheduler delay metrics.
+	// DelayMetrics enables kernel scheduler delay counters (Linux taskstats).
+	// The first read failure is reported through OnError("delay", err) once
+	// and disables delay collection permanently.
 	DelayMetrics bool
 	// OnError, if set, is called when a metric source fails. source names the
 	// failing source (for example "delay"); the client counts it under
@@ -41,8 +43,6 @@ type metricMapping struct {
 func getMappings() []metricMapping {
 	return []metricMapping{
 		{"/memory/classes/heap/objects:bytes", []string{"memory.heap.alloc"}},
-		{"/memory/classes/heap/inuse:bytes", []string{"memory.heap.inuse"}},
-		{"/memory/classes/heap/idle:bytes", []string{"memory.heap.idle"}},
 		{"/memory/classes/heap/released:bytes", []string{"memory.heap.released"}},
 		{"/memory/classes/total:bytes", []string{"memory.sys"}},
 		{"/memory/classes/heap/stacks:bytes", []string{"memory.stack.inuse"}},
@@ -80,6 +80,16 @@ type Collector struct {
 	// mu serializes collections; pauses holds the previous histogram snapshot.
 	mu     sync.Mutex
 	pauses pauseTracker
+
+	// physicalCPUs is the physical core count read once at New; 0 if unknown.
+	physicalCPUs int
+
+	// proc is the process metrics state, nil unless Config.ProcessMetrics is
+	// set and the platform supports it.
+	proc *processState
+
+	// delay is the delay metrics state, nil unless Config.DelayMetrics is set.
+	delay *delayState
 
 	startOnce sync.Once
 	stopOnce  sync.Once
@@ -128,14 +138,27 @@ func New(cfg Config, record RecordFunc) *Collector {
 	}
 	addSample(gcPausesName, nil)
 
+	var proc *processState
+	if cfg.ProcessMetrics {
+		proc = newPlatformProcessState()
+	}
+
+	var delay *delayState
+	if cfg.DelayMetrics {
+		delay = newDelayState()
+	}
+
 	return &Collector{
-		cfg:       cfg,
-		record:    record,
-		samples:   samples,
-		names:     names,
-		sampleIdx: sampleIdx,
-		derived:   derived,
-		pauseIdx:  sampleIdx[gcPausesName],
+		proc:         proc,
+		delay:        delay,
+		physicalCPUs: physicalCPUCount(),
+		cfg:          cfg,
+		record:       record,
+		samples:      samples,
+		names:        names,
+		sampleIdx:    sampleIdx,
+		derived:      derived,
+		pauseIdx:     sampleIdx[gcPausesName],
 	}
 }
 
@@ -238,6 +261,13 @@ func (c *Collector) collectOnce() {
 		c.recordPauseStats(v.Float64Histogram())
 	}
 
+	c.collectProcess()
+	c.collectDelay()
+
 	gomaxprocs := float64(runtime.GOMAXPROCS(0))
 	c.record(c.prefix()+"gomaxprocs", models.MetricTypeGauge, gomaxprocs)
+	c.record(c.prefix()+"cpu.num", models.MetricTypeGauge, float64(runtime.NumCPU()))
+	if c.physicalCPUs > 0 {
+		c.record(c.prefix()+"cpu.physical.num", models.MetricTypeGauge, float64(c.physicalCPUs))
+	}
 }

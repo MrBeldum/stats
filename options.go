@@ -2,12 +2,15 @@ package stats
 
 import (
 	"cmp"
+	"crypto/tls"
 	"maps"
+	"net/http"
 	"slices"
 	"time"
 
 	"github.com/convoy-road-trips-app/stats/models"
 	"go.opentelemetry.io/otel/attribute"
+	"google.golang.org/grpc"
 )
 
 // ref returns a pointer to a copy of v, for OTLPOverrides fields.
@@ -227,6 +230,11 @@ func WithOTLP(cfg *OTLPConfig) Option {
 		merged.ResourceAttributes = slices.Clone(cfg.ResourceAttributes)
 		merged.HistogramBuckets = slices.Clone(cfg.HistogramBuckets)
 		merged.Headers = maps.Clone(cfg.Headers)
+		if cfg.ExponentialHistogram != nil {
+			merged.ExponentialHistogram = ref(*cfg.ExponentialHistogram)
+		}
+		merged.TLSConfig = cfg.TLSConfig.Clone()
+		merged.GRPCDialOptions = slices.Clone(cfg.GRPCDialOptions)
 		if c.OTLP != nil {
 			if merged.HistogramBuckets == nil {
 				merged.HistogramBuckets = c.OTLP.HistogramBuckets
@@ -237,6 +245,13 @@ func WithOTLP(cfg *OTLPConfig) Option {
 			merged.ServiceName = cmp.Or(merged.ServiceName, c.OTLP.ServiceName)
 			merged.DeploymentEnvironment = cmp.Or(merged.DeploymentEnvironment, c.OTLP.DeploymentEnvironment)
 			merged.Retry = cmp.Or(merged.Retry, c.OTLP.Retry)
+			merged.TLSConfig = cmp.Or(merged.TLSConfig, c.OTLP.TLSConfig)
+			merged.DisableResourceDetection = merged.DisableResourceDetection || c.OTLP.DisableResourceDetection
+			merged.HTTPClient = cmp.Or(merged.HTTPClient, c.OTLP.HTTPClient)
+			if merged.GRPCDialOptions == nil {
+				merged.GRPCDialOptions = c.OTLP.GRPCDialOptions
+			}
+			merged.ExponentialHistogram = cmp.Or(merged.ExponentialHistogram, c.OTLP.ExponentialHistogram)
 		}
 		merged.Enabled = true
 		c.OTLP = &merged
@@ -250,6 +265,10 @@ func WithOTLP(cfg *OTLPConfig) Option {
 			Compression: ref(merged.Compression),
 			Protocol:    ref(merged.Protocol),
 			Temporality: ref(merged.Temporality),
+
+			CAFile:         ref(merged.CAFile),
+			ClientCertFile: ref(merged.ClientCertFile),
+			ClientKeyFile:  ref(merged.ClientKeyFile),
 		}
 	}
 }
@@ -282,6 +301,117 @@ func WithHistogramBucketsFor(name string, bounds ...float64) Option {
 	}
 }
 
+// WithUnprefixedHistogramBucketsFor is like WithHistogramBucketsFor, but the
+// bounds also apply to every metric whose name ends in ".name", whatever prefix
+// the client adds, so bounds registered for "request.duration" serve
+// "myapp.request.duration" too. It is meant for code that instruments a
+// library and cannot know the prefix its metrics end up under.
+//
+// Precedence for a metric name: an exact WithHistogramBucketsFor entry, then
+// the unprefixed entry of the longest matching suffix (the full name counts
+// as the longest), then WithHistogramBuckets, then the defaults. Matching by
+// suffix cannot tell a derived name from an unrelated one that ends the same
+// way, which is why it is opt-in. Bounds are validated and copied like
+// WithHistogramBucketsFor.
+func WithUnprefixedHistogramBucketsFor(name string, bounds ...float64) Option {
+	return WithHistogramBucketsFor(models.UnprefixedBucketsKey(name), bounds...)
+}
+
+// WithExponentialHistogram makes OTLP export histograms as base-2 exponential
+// histograms instead of explicit buckets. Every series starts at scale
+// maxScale, in [-10, 20], and is downscaled when its values need more than
+// maxSize buckets, at least 2, in its positive or its negative range. Zero
+// selects the default of either parameter: 160 buckets and scale 20, as in the
+// OTel SDK (scale 0 itself cannot be chosen). NewClient returns
+// ErrInvalidConfig for other values out of range.
+//
+// A metric with its own buckets from WithHistogramBucketsFor keeps them;
+// WithHistogramBuckets then applies to no metric. Other exporters are not
+// affected.
+func WithExponentialHistogram(maxSize, maxScale int32) Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.ExponentialHistogram = &OTLPExponentialHistogram{MaxSize: maxSize, MaxScale: maxScale}
+	}
+}
+
+// WithOTLPTLSConfig sets the base TLS configuration of a secure OTLP
+// connection, HTTP and gRPC alike (see OTLPConfig.TLSConfig). cfg is cloned.
+// It is ignored for an insecure connection.
+func WithOTLPTLSConfig(cfg *tls.Config) Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.TLSConfig = cfg.Clone()
+	}
+}
+
+// WithOTLPCertificates sets the PEM files of a secure OTLP connection: the CA
+// certificates that sign the server certificate (replacing the system roots)
+// and the client key pair for mutual TLS, which must be set together. Each
+// argument stated here beats its OTEL_EXPORTER_OTLP_CERTIFICATE,
+// CLIENT_CERTIFICATE and CLIENT_KEY variable; an empty argument leaves that
+// variable in effect. The files are read when the client is created.
+func WithOTLPCertificates(caFile, clientCertFile, clientKeyFile string) Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		for _, f := range []struct {
+			value    string
+			override **string
+			target   *string
+		}{
+			{caFile, &c.OTLPOverrides.CAFile, &c.OTLP.CAFile},
+			{clientCertFile, &c.OTLPOverrides.ClientCertFile, &c.OTLP.ClientCertFile},
+			{clientKeyFile, &c.OTLPOverrides.ClientKeyFile, &c.OTLP.ClientKeyFile},
+		} {
+			if f.value != "" {
+				*f.target, *f.override = f.value, ref(f.value)
+			}
+		}
+	}
+}
+
+// WithOTLPHTTPClient makes the OTLP/HTTP exporter send with client, which then
+// owns TLS, proxying and connection limits (see OTLPConfig.HTTPClient).
+// Validation rejects it for the gRPC protocol.
+func WithOTLPHTTPClient(client *http.Client) Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.HTTPClient = client
+	}
+}
+
+// WithOTLPGRPCDialOptions appends grpc.DialOptions to the ones the OTLP/gRPC
+// exporter sets itself (see OTLPConfig.GRPCDialOptions). Validation rejects
+// them for the HTTP protocol.
+func WithOTLPGRPCDialOptions(opts ...grpc.DialOption) Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.GRPCDialOptions = append(slices.Clone(c.OTLP.GRPCDialOptions), opts...)
+	}
+}
+
+// WithoutOTLPResourceDetection turns off the automatic host, process and SDK
+// resource attributes of the OTLP exporter (see
+// OTLPConfig.DisableResourceDetection).
+func WithoutOTLPResourceDetection() Option {
+	return func(c *Config) {
+		if c.OTLP == nil {
+			c.OTLP = &OTLPConfig{}
+		}
+		c.OTLP.DisableResourceDetection = true
+	}
+}
+
 // WithOTLPRetry retries retryable OTLP export failures with exponential backoff
 // from initial up to maxInterval, for at most maxElapsed per export. Retries
 // also stop when the export context ends.
@@ -302,5 +432,29 @@ func WithRuntimeMetrics() Option {
 		}
 		c.RuntimeMetrics.Enabled = true
 		c.RuntimeMetrics.ApplyDefaults()
+	}
+}
+
+// WithRuntimeProcessMetrics enables process-level runtime metrics (CPU,
+// memory, page faults, open files, threads, context switches) and implies
+// WithRuntimeMetrics. They are collected on Linux; other platforms emit
+// nothing extra.
+func WithRuntimeProcessMetrics() Option {
+	return func(c *Config) {
+		WithRuntimeMetrics()(c)
+		c.RuntimeMetrics.ProcessMetrics = true
+	}
+}
+
+// WithRuntimeDelayMetrics enables kernel delay counters (cpu.delay.seconds,
+// blockio.delay.seconds, swapin.delay.seconds and freepages.delay.seconds) and
+// implies WithRuntimeMetrics. They come from Linux taskstats, which needs
+// CAP_NET_ADMIN (or root) and kernel delay accounting. If the first read
+// fails, including on every non-Linux platform, the failure is counted once in
+// ExporterErrors["runtimemetrics.delay"] and delay collection stays off.
+func WithRuntimeDelayMetrics() Option {
+	return func(c *Config) {
+		WithRuntimeMetrics()(c)
+		c.RuntimeMetrics.DelayMetrics = true
 	}
 }

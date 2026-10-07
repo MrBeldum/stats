@@ -9,15 +9,13 @@ import (
 	"regexp"
 	"sync"
 
+	"github.com/convoy-road-trips-app/stats/exporters"
 	"github.com/convoy-road-trips-app/stats/models"
-	"github.com/convoy-road-trips-app/stats/serializers"
 )
 
-// serializer renders `name:value|type|#k:v,...` lines. The DogStatsD
-// serializer is used because the plain StatsD one folds attributes into the
-// metric name instead of emitting tags. It holds no per-call state, so one
-// instance is shared.
-var serializer = serializers.NewDogStatsDSerializer(nil)
+// serializer renders `name:value|type|#k:v,...` lines. It holds no per-call
+// state, so one instance is shared.
+var serializer = exporters.NewLineSerializer()
 
 // Exporter writes one StatsD-format line per metric, such as
 // `server.start:1|c` or `http.requests:1|c|#method:GET`. It is safe for
@@ -32,7 +30,10 @@ type Exporter struct {
 	mu sync.Mutex
 }
 
-var _ models.Exporter = (*Exporter)(nil)
+var (
+	_ models.Exporter = (*Exporter)(nil)
+	_ io.Writer       = (*Exporter)(nil)
+)
 
 // Name returns the exporter name.
 func (e *Exporter) Name() string { return "debugstats" }
@@ -57,6 +58,14 @@ func (e *Exporter) Export(_ context.Context, metrics []*models.Metric) error {
 		return nil
 	}
 
+	_, err = e.Write(out)
+	return err
+}
+
+// Write writes p to Dst, or to os.Stdout when Dst is nil, without any
+// serialization, so a caller can interleave its own text with the exported
+// lines. It is serialized with Export, so concurrent writes never interleave.
+func (e *Exporter) Write(p []byte) (int, error) {
 	dst := e.Dst
 	if dst == nil {
 		dst = os.Stdout
@@ -64,8 +73,7 @@ func (e *Exporter) Export(_ context.Context, metrics []*models.Metric) error {
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	_, err = dst.Write(out)
-	return err
+	return dst.Write(p)
 }
 
 // Shutdown is a no-op; the exporter holds no resources and never closes Dst.
